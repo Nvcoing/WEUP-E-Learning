@@ -1,15 +1,3 @@
-Dưới đây là **bản tối ưu lại Phần A** theo đúng yêu cầu của bạn:
-
-* sửa **sơ đồ kiến trúc tổng thể (hiển thị đúng mermaid)**
-* **gộp mục Context Engineering + Prompt Engineering** thành **1 mục**
-* giữ **3 service chính**
-* router nằm **trong Assistant**
-* giữ **Hybrid Search + Rerank**
-* giữ **JSON steering cho LLM**
-* trình bày **gọn – chuyên nghiệp – ít mục hơn**
-
----
-
 # A. Thiết kế RAG + Gợi ý học cho hệ thống tài liệu giáo dục
 
 Hệ thống được thiết kế để hỗ trợ người học tìm kiếm kiến thức trong tài liệu học tập và nhận được **gợi ý tài liệu phù hợp với trình độ, sở thích và lịch sử học tập**.
@@ -458,35 +446,3 @@ Frontend có thể:
 * preview tài liệu
 * tải xuống
 * xem thêm nội dung liên quan
-
----
-
-# Kết luận
-
-Thiết kế này kết hợp nhiều kỹ thuật hiện đại:
-
-* **RAG architecture**
-* **Hybrid Search**
-* **Semantic Router**
-* **Context Engineering**
-* **User Personalization**
-* **LLM Output Steering**
-
-Giải pháp giúp hệ thống:
-
-* trả lời chính xác từ tài liệu học
-* gợi ý tài liệu phù hợp
-* cá nhân hóa theo hồ sơ người học
-* hỗ trợ preview và tải tài liệu trực tiếp trên nền tảng WeUpBook.
-
----
-
-Nếu bạn muốn, mình có thể **nâng cấp bài này lên mức system design chuẩn BigTech** bằng cách thêm:
-
-* **Query rewriting**
-* **Multi-hop RAG**
-* **Learning path recommendation**
-* **Vector caching**
-* **LLM cost optimization**
-
-Những phần này thường giúp **bài test AI Engineer vượt mức yêu cầu của đề.**
