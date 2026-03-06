@@ -1,492 +1,249 @@
-Dưới đây là **bản tối ưu lại Phần A** theo đúng yêu cầu của bạn:
+# B. Workflow Tự Động Hóa — AI Agent với n8n
 
-* sửa **sơ đồ kiến trúc tổng thể (hiển thị đúng mermaid)**
-* **gộp mục Context Engineering + Prompt Engineering** thành **1 mục**
-* giữ **3 service chính**
-* router nằm **trong Assistant**
-* giữ **Hybrid Search + Rerank**
-* giữ **JSON steering cho LLM**
-* trình bày **gọn – chuyên nghiệp – ít mục hơn**
+Workflow tự động hóa toàn bộ quy trình: từ khi có **tài liệu mới trên S3** → index vào RAG → match với user profile → **gửi gợi ý học cá nhân hóa** đến người dùng.
+
+Công cụ sử dụng: **n8n** (self-hosted hoặc cloud), kết hợp với các service từ Phần A.
 
 ---
 
-# A. Thiết kế RAG + Gợi ý học cho hệ thống tài liệu giáo dục
+## 1. Tổng quan kiến trúc Workflow
 
-Hệ thống được thiết kế để hỗ trợ người học tìm kiếm kiến thức trong tài liệu học tập và nhận được **gợi ý tài liệu phù hợp với trình độ, sở thích và lịch sử học tập**.
+Workflow gồm **2 luồng chính** chạy độc lập:
 
-Kiến trúc sử dụng **Retrieval-Augmented Generation (RAG)** kết hợp:
-
-* **Hybrid Search**
-* **Semantic Router**
-* **Context Engineering**
-* **Cá nhân hóa theo hồ sơ người học**
-
-Backend triển khai theo **microservices với 3 service chính**:
-
-* **Document Service**
-* **Embedding Service**
-* **Assistant Service**
-
-Các service chạy bằng **FastAPI + Docker** và được truy cập thông qua **Nginx Gateway**.
+| Luồng | Tên | Mục đích |
+|---|---|---|
+| Luồng 1 | Document Ingestion Workflow | Xử lý tài liệu mới từ S3 → index RAG |
+| Luồng 2 | User Notification Workflow | Match user → gửi gợi ý học |
 
 ---
 
-# 1. Kiến trúc tổng thể hệ thống
+## 2. Luồng 1 — Document Ingestion Workflow
 
-Hệ thống gồm hai luồng chính:
+### Mô tả
 
-* **Document Ingestion Pipeline** (xử lý tài liệu)
-* **User Query Pipeline** (trả lời câu hỏi)
+Khi có file PDF hoặc video transcript mới được upload lên S3, hệ thống tự động kích hoạt pipeline xử lý, tách text, chuẩn hóa, và đưa vào RAG để index.
+
+### Workflow Diagram
+
+```mermaid
+flowchart TD
+
+    T1([Trigger\nS3 Event / Webhook / Cron])
+
+    T1 --> V1{Validate\nFile hợp lệ?}
+
+    V1 -- Không hợp lệ --> ERR1[Log Error\n+ Alert Admin]
+    ERR1 --> STOP1([Dừng])
+
+    V1 -- Hợp lệ --> S1[Lấy file từ S3\nn8n S3 Node]
+
+    S1 --> S2{Loại file?}
+
+    S2 -- PDF --> P1[Parse PDF\nPyMuPDF via HTTP Node]
+    S2 -- Video Transcript --> P2[Chuẩn hóa Transcript\nLoại bỏ timestamp / nhiễu]
+    S2 -- Text --> P3[Load Text trực tiếp]
+
+    P1 --> M1[Thêm Metadata\ntopic, level, source, upload_date, doc_id]
+    P2 --> M1
+    P3 --> M1
+
+    M1 --> C1[Chunking\n512–1024 tokens / sentence-based]
+
+    C1 --> E1[Gọi Embedding Service\nHTTP POST /embed]
+
+    E1 --> V2{Embedding\nthành công?}
+
+    V2 -- Thất bại --> ERR2[Retry tối đa 3 lần\nNếu vẫn lỗi → Log + Dead Letter Queue]
+    ERR2 --> STOP2([Dừng / Cần xử lý thủ công])
+
+    V2 -- Thành công --> Q1[Upsert vào Qdrant\nVector + Metadata]
+
+    Q1 --> DB1[Cập nhật trạng thái DB\nstatus = indexed\nindexed_at = now]
+
+    DB1 --> N1[Trigger Luồng 2\nUser Notification Workflow\nqua Webhook hoặc Message Queue]
+
+    N1 --> DONE1([Luồng 1 hoàn thành])
+```
+
+### Các node n8n chính
+
+| Bước | n8n Node | Mô tả |
+|---|---|---|
+| Trigger | S3 Trigger / Webhook / Schedule | Nhận event file mới |
+| Lấy file | AWS S3 Node (Download) | Tải file từ S3 |
+| Parse PDF | HTTP Request Node | Gọi Document Service `/parse` |
+| Metadata | Set Node | Gán topic, level, source, upload_date |
+| Chunking | HTTP Request Node | Gọi Document Service `/chunk` |
+| Embedding | HTTP Request Node | Gọi Embedding Service `/embed` |
+| Upsert Vector | HTTP Request Node | Gọi Qdrant REST API `/upsert` |
+| Cập nhật DB | PostgreSQL Node | UPDATE documents SET status = 'indexed' |
+| Trigger Luồng 2 | Webhook / RabbitMQ Node | Kích hoạt notification workflow |
+
+---
+
+## 3. Luồng 2 — User Notification Workflow
+
+### Mô tả
+
+Sau khi tài liệu được index xong, hệ thống tự động lấy user profile từ DB, tính độ tương đồng giữa nội dung tài liệu và sở thích người dùng, sau đó gửi gợi ý học cá nhân hóa.
+
+### Workflow Diagram
+
+```mermaid
+flowchart TD
+
+    T2([Trigger\nWebhook từ Luồng 1\ndoc_id, course_id, topic, level])
+
+    T2 --> F1[Lấy User Profile từ DB\nPostgreSQL Node\nWHERE level MATCH AND interests MATCH]
+
+    F1 --> V3{Có user\nphù hợp không?}
+
+    V3 -- Không --> LOG1[Log: No matching users\nDừng workflow]
+
+    V3 -- Có --> M2[Match User với Tài liệu\nSo sánh interests, level, learning_history]
+
+    M2 --> F2[Lấy chunks tiêu biểu từ Qdrant\nTop 3 chunks của tài liệu mới]
+
+    F2 --> G1[Gọi LLM\nGenerate gợi ý cá nhân hóa\ntheo từng user level]
+
+    G1 --> V4{LLM response\nhợp lệ?}
+
+    V4 -- Timeout / Lỗi --> ERR3[Retry 2 lần\nNếu vẫn lỗi → dùng template mặc định]
+    ERR3 --> SEND
+
+    V4 -- Thành công --> SEND[Gửi thông báo\nEmail / Zalo / Slack / API]
+
+    SEND --> LOG2[Ghi log vào DB\nnotification_sent_at, channel, status]
+
+    LOG2 --> DONE2([Luồng 2 hoàn thành])
+```
+
+### Các node n8n chính
+
+| Bước | n8n Node | Mô tả |
+|---|---|---|
+| Trigger | Webhook Node | Nhận doc_id, topic, level từ Luồng 1 |
+| Lấy User | PostgreSQL Node | SELECT users WHERE level và interests phù hợp |
+| Match | Function Node (JS) | So sánh interests với topic của tài liệu |
+| Lấy Chunks | HTTP Request Node | GET Qdrant top 3 chunks của doc_id |
+| Gọi LLM | HTTP Request Node | POST tới LLM API để generate gợi ý |
+| Gửi Email | Gmail / SMTP Node | Gửi email thông báo |
+| Gửi Zalo/Slack | HTTP Request Node | Gọi Zalo OA API hoặc Slack Webhook |
+| Log DB | PostgreSQL Node | INSERT notification log |
+
+---
+
+## 4. Xử lý lỗi (Error Handling)
 
 ```mermaid
 flowchart LR
 
-%% CLIENT
-subgraph Client
-U[WeUpBook Frontend]
-end
+    E1[File hỏng / không parse được]
+    E2[Timeout API Embedding]
+    E3[Qdrant không phản hồi]
+    E4[LLM rate limit]
+    E5[S3 không trả kết quả]
 
-%% GATEWAY
-subgraph Gateway
-N[Nginx API Gateway]
-end
+    E1 --> H1[Log lỗi vào DB\nstatus = parse_failed\nAlert admin qua Slack]
 
-%% SERVICES
-subgraph Backend Services
+    E2 --> H2[Retry tối đa 3 lần\nDelay exponential backoff\n1s → 2s → 4s]
 
-A[Assistant Service\nRouter + RAG + Context]
+    E3 --> H3[Retry 3 lần\nNếu vẫn lỗi → đẩy vào Dead Letter Queue\n Xử lý thủ công sau]
 
-D[Document Service\nParse + Chunk]
+    E4 --> H4[Retry sau 60s\nFallback: dùng template gợi ý mặc định]
 
-E[Embedding Service\nVectorize]
-
-end
-
-%% DATA
-subgraph Data Layer
-
-S3[(S3 Document Storage)]
-
-Q[(Qdrant Vector Database)]
-
-P[(User Profile DB\nPostgreSQL / MongoDB)]
-
-end
-
-%% AI
-subgraph AI Layer
-
-LLM[LLM API]
-
-SE[Search Engine]
-
-end
-
-U --> N
-
-N --> A
-N --> D
-
-D --> S3
-D --> E
-
-E --> Q
-
-A --> Q
-A --> P
-A --> LLM
-A --> SE
+    E5 --> H5[Check S3 event lại sau 5 phút\nNếu vẫn không có → Alert admin]
 ```
 
-### Vai trò các service
+### Bảng tóm tắt xử lý lỗi
 
-| Service           | Chức năng                             |
-| ----------------- | ------------------------------------- |
-| Document Service  | xử lý và phân đoạn tài liệu           |
-| Embedding Service | tạo vector embedding                  |
-| Assistant Service | router + retrieval + prompt + gọi LLM |
+| Loại lỗi | Chiến lược xử lý |
+|---|---|
+| File hỏng / không parse được | Log + alert admin, skip file, đánh dấu `status = parse_failed` |
+| Timeout API (Embedding / LLM) | Retry exponential backoff (1s → 2s → 4s), tối đa 3 lần |
+| Rate limit LLM | Retry sau 60s, fallback về template gợi ý mặc định |
+| Qdrant không phản hồi | Retry 3 lần → Dead Letter Queue → xử lý thủ công |
+| S3 không trả kết quả | Poll lại sau 5 phút, tối đa 3 lần → alert admin |
+| Không có user phù hợp | Log + dừng workflow, không gửi thông báo thừa |
 
 ---
 
-# 2. Pipeline xử lý tài liệu (Document Ingestion)
+## 5. Nội dung thông báo gửi tới User
 
-Khi tài liệu mới được tải lên hệ thống, pipeline sẽ tự động chuyển tài liệu thành vector để phục vụ RAG.
+Thông báo được cá nhân hóa theo `level` và `interests` của từng user.
+
+### Ví dụ nội dung Email / Zalo
+
+```
+Chào [Tên User],
+
+Tài liệu mới phù hợp với bạn vừa được thêm vào WeUpBook 🎉
+
+📚 Tài liệu: Python Basics — Variables & Data Types
+📌 Chủ đề: Python, Lập trình cơ bản
+🎯 Phù hợp với trình độ: Beginner
+
+💡 Gợi ý học:
+Tài liệu này phù hợp với lịch sử học của bạn.
+Bạn đã hoàn thành "Nhập môn lập trình" — đây là bước tiếp theo lý tưởng!
+
+🔗 Xem tài liệu: https://weupbook.vn/docs/python-basics
+⬇️ Tải xuống: https://s3.../python-basics.pdf
+
+Chúc bạn học tốt!
+WeUpBook Team
+```
+
+---
+
+## 6. Sơ đồ tổng hợp 2 Luồng
 
 ```mermaid
 flowchart LR
 
-S3[(Upload Document)]
+    subgraph Luồng 1 - Document Ingestion
+        S3[(S3\nFile mới)] --> T[Trigger n8n]
+        T --> PARSE[Parse + Chunk]
+        PARSE --> EMBED[Embedding Service]
+        EMBED --> QDRANT[(Qdrant\nVector DB)]
+        QDRANT --> DBUPDATE[(DB Update\nstatus = indexed)]
+    end
 
-S3 --> P1[Parse with PyMuPDF]
+    subgraph Luồng 2 - User Notification
+        WEBHOOK[Webhook Trigger] --> USERDB[(User Profile DB)]
+        USERDB --> MATCH[Match User + Doc]
+        MATCH --> LLM[LLM Generate\nGợi ý cá nhân hóa]
+        LLM --> NOTIFY[Gửi thông báo\nEmail / Zalo / Slack]
+        NOTIFY --> LOGDB[(Log DB)]
+    end
 
-P1 --> P2[Convert to Markdown / HTML]
-
-P2 --> P3[Extract Tables Formula Images]
-
-P3 --> P4[Sentence Chunking]
-
-P4 --> P5[Generate Embeddings]
-
-P5 --> P6[Store Vector + Metadata]
-
-P6 --> Q[(Qdrant)]
-```
-
-### Chiến lược xử lý tài liệu
-
-**1. Parsing**
-
-Sử dụng **PyMuPDF** để:
-
-* chuyển PDF → **Markdown hoặc HTML**
-* giữ nguyên cấu trúc:
-
-  * heading
-  * bảng
-  * công thức LaTeX
-  * code block
-  * hình ảnh
-
----
-
-**2. Chunking**
-
-Thực hiện **chunk theo câu (sentence-based chunking)** để tránh cắt mất ý nghĩa.
-
-Cấu hình:
-
-| tham số    | giá trị         |
-| ---------- | --------------- |
-| chunk size | 512–1024 tokens |
-| overlap    | 10–15%          |
-
-Ví dụ:
-
-```
-Chunk 1
-Sentence 1
-Sentence 2
-Sentence 3
-
-Chunk 2
-Sentence 3
-Sentence 4
-Sentence 5
+    DBUPDATE --> WEBHOOK
 ```
 
 ---
 
-**3. Xử lý nội dung đặc biệt**
+## 7. Tại sao chọn n8n?
 
-| loại dữ liệu | xử lý                      |
-| ------------ | -------------------------- |
-| bảng         | giữ HTML table             |
-| công thức    | latex                      |
-| ảnh          | trích caption để embedding |
-| code         | markdown block             |
-
----
-
-# 3. Schema Vector Database (Qdrant)
-
-Vector database dùng để lưu embedding của từng đoạn tài liệu.
-
-### Collection
-
-```
-collection: learning_documents
-```
-
-### Vector config
-
-```
-vector_size: 768 hoặc 1024
-distance: cosine
-```
-
-### Payload Metadata
-
-```
-{
-  doc_id: string,
-  title: string,
-  source: s3_url,
-
-  topic: string,
-  course: string,
-
-  level: beginner | intermediate | advanced,
-
-  chunk_id: string,
-  chunk_index: int,
-
-  content: text,
-
-  page_number: int,
-
-  upload_date: datetime
-}
-```
-
-Metadata giúp:
-
-* filter theo **level**
-* filter theo **course**
-* gợi ý **tài liệu liên quan**
+| Tiêu chí | n8n |
+|---|---|
+| Self-hosted | ✅ Kiểm soát dữ liệu hoàn toàn |
+| Kết nối S3 | ✅ AWS S3 Node có sẵn |
+| Kết nối PostgreSQL / MongoDB | ✅ Node có sẵn |
+| HTTP Request linh hoạt | ✅ Gọi bất kỳ API nào (Embedding, Qdrant, LLM) |
+| Error handling | ✅ Retry, Error Workflow, Dead Letter |
+| Webhook trigger | ✅ Kích hoạt giữa các workflow |
+| Monitoring | ✅ Execution log tích hợp sẵn |
+| Chi phí | ✅ Miễn phí (self-hosted) |
 
 ---
 
-# 4. Router bằng Embedding trong Assistant Service
+## Kết luận Phần B
 
-Assistant Service chứa một **semantic router** để xác định loại câu hỏi của người dùng.
+Workflow tự động hóa với n8n bao gồm:
 
-Router hoạt động bằng cách:
+- **Luồng 1** tự động nhận tài liệu từ S3, parse, chunk, embed và index vào Qdrant
+- **Luồng 2** match user profile với nội dung tài liệu, gọi LLM tạo gợi ý cá nhân hóa và gửi thông báo
+- **Xử lý lỗi** đầy đủ với retry, fallback và dead letter queue
+- **Thông báo cá nhân hóa** theo level và sở thích của từng người dùng
 
-1. embed câu hỏi
-2. so sánh với embedding của **case description**
-3. chọn case similarity cao nhất
-
-```mermaid
-flowchart LR
-
-Q[User Query]
-
-Q --> E1[Embed Query]
-
-E1 --> C1[Compare Case Embeddings]
-
-C1 --> RAG[Learning Question]
-
-C1 --> WEB[External Knowledge]
-
-C1 --> UNKNOWN[Unclear Query]
-```
-
-### Các case
-
-| Case              | Hành động         |
-| ----------------- | ----------------- |
-| learning_question | chạy RAG          |
-| external_question | gọi search engine |
-| unclear_query     | yêu cầu hỏi lại   |
-
-Ví dụ:
-
-| Query                 | Case          |
-| --------------------- | ------------- |
-| Python variable là gì | RAG           |
-| Hôm nay thời tiết     | search engine |
-| asdfasdf              | unclear       |
-
----
-
-# 5. Hybrid Search và Reranking
-
-Để tăng độ chính xác retrieval, hệ thống sử dụng **Hybrid Search**.
-
-```mermaid
-flowchart LR
-
-Q[User Query]
-
-Q --> S1[Semantic Search\nEmbedding]
-
-Q --> S2[Keyword Search\nSparse]
-
-S1 --> SC1[Semantic Score]
-
-S2 --> SC2[Keyword Score]
-
-SC1 --> NORM[Normalize Score]
-
-SC2 --> NORM
-
-NORM --> AVG[Average Score]
-
-AVG --> TOPK[Top K Chunks]
-
-TOPK --> RERANK[Cross Encoder Rerank]
-
-RERANK --> RESULT[Final Context]
-```
-
-Công thức kết hợp score:
-
-```
-final_score = (semantic_score + keyword_score) / 2
-```
-
-Quy trình:
-
-1. semantic search
-2. keyword search
-3. normalize score
-4. combine score
-5. lấy **top 20 chunks**
-6. **rerank → top 5**
-
----
-
-# 6. Context Engineering và Cá nhân hóa người học
-
-Prompt gửi vào LLM được xây dựng từ:
-
-* **context tài liệu**
-* **user profile**
-* **case router**
-
-Thông tin hồ sơ người học được lấy từ database:
-
-```
-{
-  user_id
-  level
-  interests
-  learning_history
-  completed_courses
-}
-```
-
-LLM sẽ điều chỉnh cách giải thích theo trình độ:
-
-| level        | cách giải thích     |
-| ------------ | ------------------- |
-| beginner     | ví dụ đơn giản      |
-| intermediate | thêm thuật ngữ      |
-| advanced     | giải thích chi tiết |
-
----
-
-### Prompt structure
-
-System Prompt:
-
-```
-Bạn là trợ lý học tập cho nền tảng WeUpBook.
-
-Nhiệm vụ:
-- Trả lời dựa trên tài liệu cung cấp
-- Giải thích phù hợp trình độ người học
-- Đưa ra gợi ý tài liệu liên quan
-
-Quy tắc:
-
-1. Chỉ sử dụng thông tin trong context
-2. Nếu không có thông tin hãy nói rõ
-3. Luôn trích dẫn tài liệu
-4. Gợi ý tài liệu liên quan
-```
-
----
-
-Context:
-
-```
-<context>
-
-[1] Python Basics - Variable
-...
-
-[2] Python OOP - Class
-...
-
-</context>
-```
-
----
-
-User Info:
-
-```
-User level: beginner
-User interests: Python, Data Science
-Learning history: Python basics completed
-```
-
----
-
-User Question:
-
-```
-Python variable là gì?
-```
-
----
-
-# 7. Steering LLM trả JSON gợi ý tài liệu
-
-Để frontend có thể **preview hoặc download tài liệu**, LLM được yêu cầu trả về JSON.
-
-Prompt instruction:
-
-```
-Trả lời theo format JSON:
-
-{
- "answer": "...",
- "suggested_documents":[
-   {
-     "title":"",
-     "topic":"",
-     "preview_url":"",
-     "download_url":""
-   }
- ]
-}
-```
-
----
-
-Ví dụ output:
-
-```
-{
- "answer":"Biến trong Python là nơi lưu trữ giá trị...",
- "suggested_documents":[
-  {
-   "title":"Python Basics",
-   "topic":"Variables",
-   "preview_url":"weupbook/docs/python-basic",
-   "download_url":"s3/.../python-basic.pdf"
-  }
- ]
-}
-```
-
-Frontend có thể:
-
-* preview tài liệu
-* tải xuống
-* xem thêm nội dung liên quan
-
----
-
-# Kết luận
-
-Thiết kế này kết hợp nhiều kỹ thuật hiện đại:
-
-* **RAG architecture**
-* **Hybrid Search**
-* **Semantic Router**
-* **Context Engineering**
-* **User Personalization**
-* **LLM Output Steering**
-
-Giải pháp giúp hệ thống:
-
-* trả lời chính xác từ tài liệu học
-* gợi ý tài liệu phù hợp
-* cá nhân hóa theo hồ sơ người học
-* hỗ trợ preview và tải tài liệu trực tiếp trên nền tảng WeUpBook.
-
----
-
-Nếu bạn muốn, mình có thể **nâng cấp bài này lên mức system design chuẩn BigTech** bằng cách thêm:
-
-* **Query rewriting**
-* **Multi-hop RAG**
-* **Learning path recommendation**
-* **Vector caching**
-* **LLM cost optimization**
-
-Những phần này thường giúp **bài test AI Engineer vượt mức yêu cầu của đề.**
+Toàn bộ workflow có thể triển khai **không cần code**, chỉ cần cấu hình nodes trong n8n — phù hợp để **mở rộng nhanh** khi số lượng tài liệu và người dùng tăng cao.
