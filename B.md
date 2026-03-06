@@ -2,248 +2,181 @@
 
 Workflow tự động hóa toàn bộ quy trình: từ khi có **tài liệu mới trên S3** → index vào RAG → match với user profile → **gửi gợi ý học cá nhân hóa** đến người dùng.
 
-Công cụ sử dụng: **n8n** (self-hosted hoặc cloud), kết hợp với các service từ Phần A.
+Công cụ: **n8n** self-hosted, kết hợp các service từ Phần A.
 
 ---
 
-## 1. Tổng quan kiến trúc Workflow
-
-Workflow gồm **2 luồng chính** chạy độc lập:
-
-| Luồng | Tên | Mục đích |
-|---|---|---|
-| Luồng 1 | Document Ingestion Workflow | Xử lý tài liệu mới từ S3 → index RAG |
-| Luồng 2 | User Notification Workflow | Match user → gửi gợi ý học |
-
----
-
-## 2. Luồng 1 — Document Ingestion Workflow
-
-### Mô tả
-
-Khi có file PDF hoặc video transcript mới được upload lên S3, hệ thống tự động kích hoạt pipeline xử lý, tách text, chuẩn hóa, và đưa vào RAG để index.
-
-### Workflow Diagram
-
-```mermaid
-flowchart TD
-
-    T1([Trigger\nS3 Event / Webhook / Cron])
-
-    T1 --> V1{Validate\nFile hợp lệ?}
-
-    V1 -- Không hợp lệ --> ERR1[Log Error\n+ Alert Admin]
-    ERR1 --> STOP1([Dừng])
-
-    V1 -- Hợp lệ --> S1[Lấy file từ S3\nn8n S3 Node]
-
-    S1 --> S2{Loại file?}
-
-    S2 -- PDF --> P1[Parse PDF\nPyMuPDF via HTTP Node]
-    S2 -- Video Transcript --> P2[Chuẩn hóa Transcript\nLoại bỏ timestamp / nhiễu]
-    S2 -- Text --> P3[Load Text trực tiếp]
-
-    P1 --> M1[Thêm Metadata\ntopic, level, source, upload_date, doc_id]
-    P2 --> M1
-    P3 --> M1
-
-    M1 --> C1[Chunking\n512–1024 tokens / sentence-based]
-
-    C1 --> E1[Gọi Embedding Service\nHTTP POST /embed]
-
-    E1 --> V2{Embedding\nthành công?}
-
-    V2 -- Thất bại --> ERR2[Retry tối đa 3 lần\nNếu vẫn lỗi → Log + Dead Letter Queue]
-    ERR2 --> STOP2([Dừng / Cần xử lý thủ công])
-
-    V2 -- Thành công --> Q1[Upsert vào Qdrant\nVector + Metadata]
-
-    Q1 --> DB1[Cập nhật trạng thái DB\nstatus = indexed\nindexed_at = now]
-
-    DB1 --> N1[Trigger Luồng 2\nUser Notification Workflow\nqua Webhook hoặc Message Queue]
-
-    N1 --> DONE1([Luồng 1 hoàn thành])
-```
-
-### Các node n8n chính
-
-| Bước | n8n Node | Mô tả |
-|---|---|---|
-| Trigger | S3 Trigger / Webhook / Schedule | Nhận event file mới |
-| Lấy file | AWS S3 Node (Download) | Tải file từ S3 |
-| Parse PDF | HTTP Request Node | Gọi Document Service `/parse` |
-| Metadata | Set Node | Gán topic, level, source, upload_date |
-| Chunking | HTTP Request Node | Gọi Document Service `/chunk` |
-| Embedding | HTTP Request Node | Gọi Embedding Service `/embed` |
-| Upsert Vector | HTTP Request Node | Gọi Qdrant REST API `/upsert` |
-| Cập nhật DB | PostgreSQL Node | UPDATE documents SET status = 'indexed' |
-| Trigger Luồng 2 | Webhook / RabbitMQ Node | Kích hoạt notification workflow |
-
----
-
-## 3. Luồng 2 — User Notification Workflow
-
-### Mô tả
-
-Sau khi tài liệu được index xong, hệ thống tự động lấy user profile từ DB, tính độ tương đồng giữa nội dung tài liệu và sở thích người dùng, sau đó gửi gợi ý học cá nhân hóa.
-
-### Workflow Diagram
-
-```mermaid
-flowchart TD
-
-    T2([Trigger\nWebhook từ Luồng 1\ndoc_id, course_id, topic, level])
-
-    T2 --> F1[Lấy User Profile từ DB\nPostgreSQL Node\nWHERE level MATCH AND interests MATCH]
-
-    F1 --> V3{Có user\nphù hợp không?}
-
-    V3 -- Không --> LOG1[Log: No matching users\nDừng workflow]
-
-    V3 -- Có --> M2[Match User với Tài liệu\nSo sánh interests, level, learning_history]
-
-    M2 --> F2[Lấy chunks tiêu biểu từ Qdrant\nTop 3 chunks của tài liệu mới]
-
-    F2 --> G1[Gọi LLM\nGenerate gợi ý cá nhân hóa\ntheo từng user level]
-
-    G1 --> V4{LLM response\nhợp lệ?}
-
-    V4 -- Timeout / Lỗi --> ERR3[Retry 2 lần\nNếu vẫn lỗi → dùng template mặc định]
-    ERR3 --> SEND
-
-    V4 -- Thành công --> SEND[Gửi thông báo\nEmail / Zalo / Slack / API]
-
-    SEND --> LOG2[Ghi log vào DB\nnotification_sent_at, channel, status]
-
-    LOG2 --> DONE2([Luồng 2 hoàn thành])
-```
-
-### Các node n8n chính
-
-| Bước | n8n Node | Mô tả |
-|---|---|---|
-| Trigger | Webhook Node | Nhận doc_id, topic, level từ Luồng 1 |
-| Lấy User | PostgreSQL Node | SELECT users WHERE level và interests phù hợp |
-| Match | Function Node (JS) | So sánh interests với topic của tài liệu |
-| Lấy Chunks | HTTP Request Node | GET Qdrant top 3 chunks của doc_id |
-| Gọi LLM | HTTP Request Node | POST tới LLM API để generate gợi ý |
-| Gửi Email | Gmail / SMTP Node | Gửi email thông báo |
-| Gửi Zalo/Slack | HTTP Request Node | Gọi Zalo OA API hoặc Slack Webhook |
-| Log DB | PostgreSQL Node | INSERT notification log |
-
----
-
-## 4. Xử lý lỗi (Error Handling)
+## 1. Luồng 1 — Document Ingestion Workflow
 
 ```mermaid
 flowchart LR
 
-    E1[File hỏng / không parse được]
-    E2[Timeout API Embedding]
-    E3[Qdrant không phản hồi]
-    E4[LLM rate limit]
-    E5[S3 không trả kết quả]
+classDef trigger   fill:#FF6D5A,stroke:#c0392b,color:#fff
+classDef action    fill:#2c2c3e,stroke:#444,color:#fff
+classDef condition fill:#3d3d3d,stroke:#555,color:#fff
+classDef service   fill:#1a4a6b,stroke:#0d3b57,color:#fff
+classDef db        fill:#1565C0,stroke:#0d47a1,color:#fff
+classDef error     fill:#922b21,stroke:#7b241c,color:#fff
+classDef done      fill:#1e8449,stroke:#196f3d,color:#fff
 
-    E1 --> H1[Log lỗi vào DB\nstatus = parse_failed\nAlert admin qua Slack]
+T1([S3 Event\nTrigger]):::trigger
 
-    E2 --> H2[Retry tối đa 3 lần\nDelay exponential backoff\n1s → 2s → 4s]
+T1 --> V1{Validate\nFile?}:::condition
 
-    E3 --> H3[Retry 3 lần\nNếu vẫn lỗi → đẩy vào Dead Letter Queue\n Xử lý thủ công sau]
+V1 -- invalid --> ERR1[Log Error\nAlert Admin]:::error
+V1 -- valid --> S1[AWS S3\nDownload File]:::service
 
-    E4 --> H4[Retry sau 60s\nFallback: dùng template gợi ý mặc định]
+S1 --> SW{Switch\nFile Type}:::condition
 
-    E5 --> H5[Check S3 event lại sau 5 phút\nNếu vẫn không có → Alert admin]
-```
+SW -- PDF --> P1[HTTP Request\nPOST /parse PDF]:::action
+SW -- Transcript --> P2[Function Node\nClean Transcript]:::action
+SW -- Text --> P3[Set Node\nLoad Text]:::action
 
-### Bảng tóm tắt xử lý lỗi
+P1 --> META[Set Node\nAdd Metadata\ntopic · level · doc_id · date]:::action
+P2 --> META
+P3 --> META
 
-| Loại lỗi | Chiến lược xử lý |
-|---|---|
-| File hỏng / không parse được | Log + alert admin, skip file, đánh dấu `status = parse_failed` |
-| Timeout API (Embedding / LLM) | Retry exponential backoff (1s → 2s → 4s), tối đa 3 lần |
-| Rate limit LLM | Retry sau 60s, fallback về template gợi ý mặc định |
-| Qdrant không phản hồi | Retry 3 lần → Dead Letter Queue → xử lý thủ công |
-| S3 không trả kết quả | Poll lại sau 5 phút, tối đa 3 lần → alert admin |
-| Không có user phù hợp | Log + dừng workflow, không gửi thông báo thừa |
+META --> CHUNK[HTTP Request\nPOST /chunk\n512-1024 tokens]:::action
 
----
+CHUNK --> EMBED[HTTP Request\nPOST /embed\nEmbedding Service]:::service
 
-## 5. Nội dung thông báo gửi tới User
+EMBED --> V2{Embedding\nOK?}:::condition
 
-Thông báo được cá nhân hóa theo `level` và `interests` của từng user.
+V2 -- fail --> ERR2[Retry Node\n3x backoff\nDead Letter Queue]:::error
+V2 -- ok --> QDRANT[HTTP Request\nPUT Qdrant\nupsert vector]:::db
 
-### Ví dụ nội dung Email / Zalo
+QDRANT --> PGUPDATE[PostgreSQL\nUPDATE status\nindexed_at = now]:::db
 
-```
-Chào [Tên User],
-
-Tài liệu mới phù hợp với bạn vừa được thêm vào WeUpBook 🎉
-
-📚 Tài liệu: Python Basics — Variables & Data Types
-📌 Chủ đề: Python, Lập trình cơ bản
-🎯 Phù hợp với trình độ: Beginner
-
-💡 Gợi ý học:
-Tài liệu này phù hợp với lịch sử học của bạn.
-Bạn đã hoàn thành "Nhập môn lập trình" — đây là bước tiếp theo lý tưởng!
-
-🔗 Xem tài liệu: https://weupbook.vn/docs/python-basics
-⬇️ Tải xuống: https://s3.../python-basics.pdf
-
-Chúc bạn học tốt!
-WeUpBook Team
+PGUPDATE --> WH_OUT([Webhook\nTrigger Flow 2]):::trigger
 ```
 
 ---
 
-## 6. Sơ đồ tổng hợp 2 Luồng
+## 2. Luồng 2 — User Notification Workflow
 
 ```mermaid
 flowchart LR
 
-    subgraph Luồng 1 - Document Ingestion
-        S3[(S3\nFile mới)] --> T[Trigger n8n]
-        T --> PARSE[Parse + Chunk]
-        PARSE --> EMBED[Embedding Service]
-        EMBED --> QDRANT[(Qdrant\nVector DB)]
-        QDRANT --> DBUPDATE[(DB Update\nstatus = indexed)]
-    end
+classDef trigger   fill:#FF6D5A,stroke:#c0392b,color:#fff
+classDef action    fill:#2c2c3e,stroke:#444,color:#fff
+classDef condition fill:#3d3d3d,stroke:#555,color:#fff
+classDef service   fill:#1a4a6b,stroke:#0d3b57,color:#fff
+classDef db        fill:#1565C0,stroke:#0d47a1,color:#fff
+classDef error     fill:#922b21,stroke:#7b241c,color:#fff
+classDef done      fill:#1e8449,stroke:#196f3d,color:#fff
 
-    subgraph Luồng 2 - User Notification
-        WEBHOOK[Webhook Trigger] --> USERDB[(User Profile DB)]
-        USERDB --> MATCH[Match User + Doc]
-        MATCH --> LLM[LLM Generate\nGợi ý cá nhân hóa]
-        LLM --> NOTIFY[Gửi thông báo\nEmail / Zalo / Slack]
-        NOTIFY --> LOGDB[(Log DB)]
-    end
+WH_IN([Webhook\nReceive doc_id\ncourse_id · level]):::trigger
 
-    DBUPDATE --> WEBHOOK
+WH_IN --> PG[PostgreSQL\nSELECT users\nWHERE level MATCH]:::db
+
+PG --> V3{Found\nUsers?}:::condition
+
+V3 -- none --> LOG1[Set Node\nLog No Match\nStop]:::error
+
+V3 -- found --> MATCH[Function Node\nMatch interests\nvs doc topic]:::action
+
+MATCH --> CHUNKS[HTTP Request\nGET Qdrant\nTop 3 chunks]:::db
+
+CHUNKS --> LLM[HTTP Request\nPOST LLM API\nGenerate suggestion]:::service
+
+LLM --> V4{LLM\nResponse OK?}:::condition
+
+V4 -- timeout/fail --> ERR3[Retry Node\n2x retry\nFallback template]:::error
+ERR3 --> SEND
+
+V4 -- ok --> SEND[HTTP Request\nEmail · Zalo · Slack]:::action
+
+SEND --> PGLOG[PostgreSQL\nINSERT notification\nlog · status · channel]:::db
+
+PGLOG --> DONE([Done]):::done
 ```
 
 ---
 
-## 7. Tại sao chọn n8n?
+## 3. Error Handling Workflow
 
-| Tiêu chí | n8n |
-|---|---|
-| Self-hosted | ✅ Kiểm soát dữ liệu hoàn toàn |
-| Kết nối S3 | ✅ AWS S3 Node có sẵn |
-| Kết nối PostgreSQL / MongoDB | ✅ Node có sẵn |
-| HTTP Request linh hoạt | ✅ Gọi bất kỳ API nào (Embedding, Qdrant, LLM) |
-| Error handling | ✅ Retry, Error Workflow, Dead Letter |
-| Webhook trigger | ✅ Kích hoạt giữa các workflow |
-| Monitoring | ✅ Execution log tích hợp sẵn |
-| Chi phí | ✅ Miễn phí (self-hosted) |
+```mermaid
+flowchart LR
+
+classDef trigger   fill:#FF6D5A,stroke:#c0392b,color:#fff
+classDef action    fill:#2c2c3e,stroke:#444,color:#fff
+classDef condition fill:#3d3d3d,stroke:#555,color:#fff
+classDef error     fill:#922b21,stroke:#7b241c,color:#fff
+classDef done      fill:#1e8449,stroke:#196f3d,color:#fff
+
+ERR_T([Error Trigger\nCatch All]):::trigger
+
+ERR_T --> SW2{Error\nType?}:::condition
+
+SW2 -- parse_failed   --> H1[Set Node\nstatus = parse_failed\nSkip file]:::error
+SW2 -- embed_timeout  --> H2[Retry Node\nbackoff 1s 2s 4s\nmax 3 retries]:::action
+SW2 -- qdrant_down    --> H3[Retry Node\n3x retry\nPush Dead Letter Queue]:::error
+SW2 -- llm_ratelimit  --> H4[Wait Node\nDelay 60s\nFallback template]:::action
+SW2 -- s3_missing     --> H5[Schedule Node\nPoll 5min x3\nthen alert]:::action
+
+H1 --> ALERT[HTTP Request\nSlack Alert\nAdmin channel]:::action
+H3 --> ALERT
+H5 --> ALERT
+
+H2 --> RESUME([Resume\nWorkflow]):::done
+H4 --> RESUME
+```
 
 ---
 
-## Kết luận Phần B
+## 4. Node Map — Các node n8n sử dụng
 
-Workflow tự động hóa với n8n bao gồm:
+| Node | Loại n8n | Vai trò |
+|---|---|---|
+| S3 Event Trigger | S3 Trigger | Nhận event file mới upload |
+| Validate File | IF Node | Kiểm tra định dạng, size |
+| AWS S3 Download | AWS S3 Node | Tải file về workflow |
+| Switch File Type | Switch Node | Phân nhánh PDF / Transcript / Text |
+| Parse PDF | HTTP Request | Gọi Document Service `/parse` |
+| Clean Transcript | Function Node | Loại bỏ timestamp, nhiễu |
+| Add Metadata | Set Node | Gán topic, level, doc_id, upload_date |
+| Chunking | HTTP Request | Gọi Document Service `/chunk` |
+| Embedding | HTTP Request | Gọi Embedding Service `/embed` |
+| Upsert Qdrant | HTTP Request | PUT vector + metadata vào Qdrant |
+| Update DB | PostgreSQL Node | UPDATE documents SET status = indexed |
+| Trigger Flow 2 | Webhook Node | Kích hoạt luồng notification |
+| Get Users | PostgreSQL Node | SELECT user phù hợp level + interests |
+| Match User | Function Node | So sánh interests với topic tài liệu |
+| Get Chunks | HTTP Request | GET top 3 chunks từ Qdrant |
+| Call LLM | HTTP Request | POST tới LLM API tạo gợi ý |
+| Send Notify | HTTP Request | Gọi Email / Zalo OA / Slack API |
+| Log Notification | PostgreSQL Node | INSERT log vào DB |
+| Retry Node | Retry on Fail | Exponential backoff tự động |
+| Error Trigger | Error Trigger | Bắt lỗi toàn workflow |
 
-- **Luồng 1** tự động nhận tài liệu từ S3, parse, chunk, embed và index vào Qdrant
-- **Luồng 2** match user profile với nội dung tài liệu, gọi LLM tạo gợi ý cá nhân hóa và gửi thông báo
-- **Xử lý lỗi** đầy đủ với retry, fallback và dead letter queue
-- **Thông báo cá nhân hóa** theo level và sở thích của từng người dùng
+---
 
-Toàn bộ workflow có thể triển khai **không cần code**, chỉ cần cấu hình nodes trong n8n — phù hợp để **mở rộng nhanh** khi số lượng tài liệu và người dùng tăng cao.
+## 5. Tổng hợp 2 luồng
+
+```mermaid
+flowchart LR
+
+classDef trigger fill:#FF6D5A,stroke:#c0392b,color:#fff
+classDef action  fill:#2c2c3e,stroke:#444,color:#fff
+classDef db      fill:#1565C0,stroke:#0d47a1,color:#fff
+classDef service fill:#1a4a6b,stroke:#0d3b57,color:#fff
+classDef done    fill:#1e8449,stroke:#196f3d,color:#fff
+
+subgraph FLOW1 [Luong 1 — Document Ingestion]
+    direction LR
+    A1([S3 Trigger]):::trigger --> A2[Parse + Chunk]:::action
+    A2 --> A3[Embedding Service]:::service
+    A3 --> A4[(Qdrant)]:::db
+    A4 --> A5[(PostgreSQL\nstatus = indexed)]:::db
+end
+
+subgraph FLOW2 [Luong 2 — User Notification]
+    direction LR
+    B1([Webhook Trigger]):::trigger --> B2[(Get Users\nPostgreSQL)]:::db
+    B2 --> B3[Match + LLM Generate]:::service
+    B3 --> B4[Send Email/Zalo/Slack]:::action
+    B4 --> B5[(Log DB)]:::db
+end
+
+A5 -- "doc_id · topic · level" --> B1
+```
