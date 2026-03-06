@@ -1,719 +1,213 @@
-# PHẦN B: AUTOMATION WORKFLOW VỚI N8N
-
-> **Hệ thống RAG + Automation cho WeupBook**  Triển khai với n8n  
-> Kết hợp với kiến trúc microservices đã thiết kế ở Phần A
-
+# BÀI TEST: THIẾT KẾ HỆ THỐNG RAG + AUTOMATION
 ---
 
-## Mục Lục
+## A. Thiết kế RAG + Gợi ý học
 
-1. [Tổng quan N8N trong hệ thống](#1-tổng-quan-n8n-trong-hệ-thống)
-2. [Workflow 1  Document Indexing Pipeline](#2-workflow-1--document-indexing-pipeline)
-3. [Workflow 2  RAG Query & Response](#3-workflow-2--rag-query--response)
-4. [Workflow 3  User Matching & Notification](#4-workflow-3--user-matching--notification)
-5. [Workflow 4  Scheduled Re-indexing](#5-workflow-4--scheduled-re-indexing)
-6. [Workflow 5  Error Handling & Alerting](#6-workflow-5--error-handling--alerting)
-7. [N8N Node Configuration Chi tiết](#7-n8n-node-configuration-chi-tiết)
-8. [Deployment N8N](#8-deployment-n8n)
+### 1. Sơ đồ RAG tổng quan (Microservices)
 
----
-
-## 1. Tổng quan N8N trong hệ thống
-
-### N8N đóng vai trò **Automation Orchestrator**  thay thế code logic phức tạp bằng visual workflow
+Hệ thống được thiết kế theo kiến trúc microservices với 3 service chính, tương tác qua các event và API.
 
 ```mermaid
-graph TB
-    subgraph "External Triggers"
-        S3[" AWS S3<br/>File Upload Event"]
-        SCHED[" Cron Scheduler<br/>Scheduled Tasks"]
-        WEBHOOK[" Webhook<br/>API Calls"]
-        USER[" User Action<br/>Frontend Events"]
-    end
+flowchart TD
+    %% Styles
+    classDef s3 fill:#F9E79F,stroke:#B7950B,stroke-width:2px
+    classDef db fill:#AED6F1,stroke:#1F618D,stroke-width:2px
+    classDef service fill:#F5B7B1,stroke:#C0392B,stroke-width:2px,color:black
+    classDef external fill:#D7BDE2,stroke:#7D3C98,stroke-width:2px
+    classDef vector fill:#A9DFBF,stroke:#196F3D,stroke-width:2px
 
-    subgraph "N8N Automation Layer"
+    %% Data Sources
+    S3[("<b>S3 Bucket</b><br/>PDF / Transcript / Text")]:::s3
+    UserDB[("<b>User DB</b><br/>PostgreSQL/MongoDB")]:::db
+
+    %% Trigger Flow
+    S3 -- "Event (SQS/SNS)" --> DocService
+
+    %% Document Processing Service
+    subgraph DocService [<b>Document Processing Service</b>]
         direction TB
-        WF1[" Workflow 1<br/>Document Indexing Pipeline"]
-        WF2[" Workflow 2<br/>RAG Query & Response"]
-        WF3[" Workflow 3<br/>User Matching & Notification"]
-        WF4[" Workflow 4<br/>Scheduled Re-indexing"]
-        WF5[" Workflow 5<br/>Error Handling & Alerting"]
+        P1["Parse & Extract Text"] --> P2["Chunking & Cleaning"]
+        P2 --> P3["Metadata Enrichment<br/>(topic, level, source, doc_id, date)"]
+        P3 --> P4["Call Embedding Service"]
     end
+    class DocService service
 
-    subgraph "Microservices"
-        DOC["Document Service<br/>:8001"]
-        EMBED["Embedding Service<br/>:8002"]
-        ASSIST["Assistant Service<br/>:8003"]
+    %% Embedding Service
+    subgraph EmbedService [<b>Embedding Service</b>]
+        E1["Generate Embeddings"]
     end
+    class EmbedService service
 
-    subgraph "Data Layer"
-        S3S["S3 Storage"]
-        QDRANT["Qdrant :6333"]
-        MONGO["MongoDB :27017"]
-        POSTGRES["PostgreSQL :5432"]
-        REDIS["Redis Cache"]
+    %% Vector DB
+    VectorDB[("<b>Vector DB</b><br/>Pinecone / Qdrant / Milvus")]:::vector
+
+    %% Assistant Service
+    subgraph AssistantService [<b>Assistant Service</b>]
+        direction TB
+        A1["Receive Query (question, user_id)"] --> A2["Get User Profile<br/>from UserDB"]
+        A2 --> A3["Query Vector DB<br/>(with filters)"]
+        A3 --> A4["Retrieve Top-K Chunks"]
+        A4 --> A5["Construct Dynamic Prompt<br/>(with user level & history)"]
+        A5 --> A6["Call LLM (OpenAI/Claude)"]
+        A6 --> A7["Post-Process: Format Response &<br/>Aggregate Source Documents"]
     end
+    class AssistantService service
 
-    subgraph "Notification Channels"
-        EMAIL[" Email<br/>SendGrid"]
-        ZALO[" Zalo OA"]
-        SLACK[" Slack"]
-        INAPP[" In-App"]
-    end
+    %% External LLM
+    LLM[("<b>LLM API</b><br/>GPT-4 / Claude)"]:::external
 
-    S3 --> WF1
-    SCHED --> WF4
-    WEBHOOK --> WF2
-    USER --> WF2
+    %% User Interaction
+    User(("<b>User</b>")):::external
 
-    WF1 --> DOC
-    WF1 --> EMBED
-    WF1 --> WF3
+    %% Connections
+    DocService --> EmbedService
+    EmbedService --> VectorDB
+    
+    User -- "Câu hỏi" --> AssistantService
+    AssistantService --> UserDB
+    AssistantService --> VectorDB
+    AssistantService --> LLM
+    AssistantService -- "Trả lời + Gợi ý" --> User
 
-    WF2 --> ASSIST
-    WF2 --> EMBED
-
-    WF3 --> EMAIL
-    WF3 --> ZALO
-    WF3 --> SLACK
-    WF3 --> INAPP
-
-    WF4 --> WF1
-    WF5 --> SLACK
-
-    DOC --> S3S
-    DOC --> POSTGRES
-    EMBED --> QDRANT
-    ASSIST --> MONGO
-    ASSIST --> POSTGRES
-
-    style WF1 fill:#FFC6C6
-    style WF2 fill:#E6F3FF
-    style WF3 fill:#E6FFE6
-    style WF4 fill:#FFF3E6
-    style WF5 fill:#FFE6F3
+    %% Data flow for indexing
+    VectorDB -.-> DocService
 ```
 
-### Lý do chọn N8N
-
-| Tiêu chí | N8N | Custom Code | Apache Airflow |
-|----------|-----|-------------|----------------|
-| **Setup time** |  Nhanh (visual) |  Chậm |  Chậm |
-| **Self-hosted** |  Có |  Có |  Có |
-| **HTTP integrations** |  Built-in | Manual | Manual |
-| **Error handling** |  Visual retry | Manual code | DAG-based |
-| **Cost** | Free (self-host) | Dev time | Dev time |
-| **Webhook support** |  Native | Manual | Plugin |
-| **AI nodes** |  LangChain built-in | Manual | Manual |
-
----
-
-## 2. Workflow 1  Document Indexing Pipeline
-
-> **Trigger**: S3 upload event  Index tài liệu vào Qdrant
-
-### Sơ đồ tổng quan
-
-```mermaid
-flowchart TD
-    T1([" START\nS3 Webhook Trigger"])
-
-    N1[" HTTP Request Node\nReceive S3 Event\nPOST /webhook/s3-upload"]
-
-    N2[" IF Node\nValidate Event\ncheck event_type & file_type"]
-
-    N3[" AWS S3 Node\nDownload File\nfrom bucket/key"]
-
-    N4[" Code Node\nDetect File Type\nPDF / DOCX / TXT / VTT"]
-
-    N5A[" HTTP Request\nCall Document Service\nPOST :8001/api/parse/pdf"]
-    N5B[" HTTP Request\nCall Document Service\nPOST :8001/api/parse/docx"]
-    N5C[" HTTP Request\nCall Document Service\nPOST :8001/api/parse/txt"]
-    N5D[" HTTP Request\nCall Document Service\nPOST :8001/api/parse/vtt"]
-
-    N6[" Code Node\nText Cleaning\nNormalize + Remove noise"]
-
-    N7[" Code Node\nChunking\nsize=500, overlap=100"]
-
-    N8[" PostgreSQL Node\nSave Chunks\nINSERT document_chunks"]
-
-    N9[" Split In Batches Node\nBatch size = 32"]
-
-    N10[" HTTP Request Node\nCall Embedding Service\nPOST :8002/api/embed/batch"]
-
-    N11[" IF Node\nEmbedding Success?\ncheck status == 200"]
-
-    N12[" HTTP Request Node\nUpsert to Qdrant\nPOST :6333/collections/upsert"]
-
-    N13[" PostgreSQL Node\nUpdate Status = indexed\nUPDATE documents"]
-
-    N14[" Execute Workflow Node\nTrigger WF3\nUser Matching & Notification"]
-
-    ERR[" Error Handler\nLog + Retry\nSend Slack Alert"]
-
-    T1 --> N1 --> N2
-    N2 -->|" Valid"| N3
-    N2 -->|" Invalid"| ERR
-
-    N3 --> N4
-    N4 -->|PDF| N5A
-    N4 -->|DOCX| N5B
-    N4 -->|TXT| N5C
-    N4 -->|VTT| N5D
-
-    N5A & N5B & N5C & N5D --> N6
-    N6 --> N7 --> N8 --> N9
-    N9 --> N10 --> N11
-
-    N11 -->|" Success"| N12
-    N11 -->|" Failed"| ERR
-
-    N12 --> N13 --> N14
-
-    style T1 fill:#00C853,color:#fff
-    style ERR fill:#FF5252,color:#fff
-    style N14 fill:#E6FFE6
-```
-
-### Chi tiết từng node
-
-```mermaid
-graph LR
-    subgraph "Node 1: S3 Webhook Trigger"
-        W1["Trigger Type: Webhook\nMethod: POST\nPath: /webhook/s3-upload\nAuthentication: Header Auth\nX-Webhook-Secret: {secret}"]
-    end
-
-    subgraph "Node 2: Validate Event"
-        W2["IF Condition:\n$json.event_type == 's3:ObjectCreated:Put'\nAND\n$json.content_type IN ['application/pdf',\n'text/plain', 'application/vnd.openxml...']"]
-    end
-
-    subgraph "Node 3: S3 Download"
-        W3["AWS S3 Node\nOperation: Download\nBucket: {{ $json.bucket }}\nKey: {{ $json.key }}\nReturn: Binary Data"]
-    end
-```
-
-### N8N JSON Config (Node: Embedding Batch)
-
-```json
-{
-  "name": "Call Embedding Service",
-  "type": "n8n-nodes-base.httpRequest",
-  "parameters": {
-    "method": "POST",
-    "url": "http://embedding-service:8002/api/embed/batch",
-    "authentication": "genericCredentialType",
-    "sendBody": true,
-    "bodyParameters": {
-      "parameters": [
-        {
-          "name": "texts",
-          "value": "={{ $json.chunks.map(c => c.text) }}"
-        },
-        {
-          "name": "normalize",
-          "value": true
-        }
-      ]
-    },
-    "options": {
-      "timeout": 30000,
-      "retry": {
-        "enabled": true,
-        "maxTries": 3,
-        "waitBetweenTries": 2000
-      }
-    }
-  }
-}
-```
-
----
-
-## 3. Workflow 2  RAG Query & Response
-
-> **Trigger**: User gửi câu hỏi từ Frontend  Trả về Answer + Recommendations
-
-```mermaid
-flowchart TD
-    T2([" START\nWebhook Trigger\nPOST /webhook/ask"])
-
-    N1[" HTTP Request Node\nReceive Question\n{user_id, question, session_id}"]
-
-    N2[" MongoDB Node\nGet User Profile\ndb.users.findOne({user_id})"]
-
-    N3A[" Redis Node\nCheck Semantic Cache\nGET cache:{question_hash}"]
-
-    N3B[" IF Node\nCache Hit?\nsimilarity >= 0.95"]
-
-    N4[" HTTP Request\nEmbed Question\nPOST :8002/api/embed/single"]
-
-    N5[" HTTP Request\nVector Search Qdrant\nPOST :6333/collections/search\n+ metadata filters"]
-
-    N6[" PostgreSQL Node\nGet Document Metadata\nSELECT FROM documents\nWHERE doc_id IN (...)"]
-
-    N7[" Code Node\nBuild RAG Context\nTop-5 chunks assembly"]
-
-    N8[" Code Node\nBuild Adaptive Prompt\nSwitch by user.level:\nbeginner / intermediate / advanced"]
-
-    N9[" HTTP Request\nCall Claude API\nPOST anthropic/v1/messages"]
-
-    N10[" Code Node\nScore & Rank Documents\n0.5*relevance + 0.3*level\n+ 0.2*interest"]
-
-    N11[" Redis Node\nCache Answer\nSET cache:{hash} TTL=86400"]
-
-    N12[" PostgreSQL Node\nLog Interaction\nINSERT user_interactions"]
-
-    N13[" Respond to Webhook\nReturn JSON Response\n{answer, documents, confidence}"]
-
-    CACHED[" Return Cached Answer\nSkip LLM call\nSave ~$0.03/query"]
-
-    T2 --> N1 --> N2
-    N2 --> N3A --> N3B
-
-    N3B -->|" Cache Hit"| CACHED
-    N3B -->|" Miss"| N4
-
-    CACHED --> N12
-
-    N4 --> N5 --> N6 --> N7 --> N8 --> N9 --> N10 --> N11 --> N12 --> N13
-
-    style T2 fill:#00C853,color:#fff
-    style CACHED fill:#FFD700
-    style N9 fill:#FFE6E6
-    style N13 fill:#E6FFE6
-```
-
-### Adaptive Prompt Builder  Code Node
-
-```mermaid
-graph TD
-    A["Input: user.level + context_chunks + question"]
-
-    B{"user.level?"}
-
-    C[" beginner"]
-    D[" intermediate"]
-    E[" advanced"]
-
-    F["Prompt Template BEGINNER:\n- Dùng ngôn ngữ đơn giản\n- Thêm ví dụ thực tế\n- Giải thích từng bước\n- Tránh thuật ngữ kỹ thuật\n- Dùng phép so sánh, ẩn dụ"]
-
-    G["Prompt Template INTERMEDIATE:\n- Cân bằng kỹ thuật & dễ hiểu\n- Đề cập khái niệm chính\n- Use cases thực tế\n- Một số ký hiệu toán học"]
-
-    H["Prompt Template ADVANCED:\n- Giải thích chuyên sâu\n- Toán học & công thức\n- Trích dẫn research papers\n- Edge cases & tradeoffs\n- Độ sâu lý thuyết"]
-
-    I["Final Prompt:\nSystem + Context + Question\n Claude API"]
-
-    A --> B
-    B -->|beginner| C --> F --> I
-    B -->|intermediate| D --> G --> I
-    B -->|advanced| E --> H --> I
-```
-
----
-
-## 4. Workflow 3  User Matching & Notification
-
-> **Trigger**: Sau khi document được index xong  Tìm users phù hợp  Gửi thông báo
-
-```mermaid
-flowchart TD
-    T3([" START\nExecute Workflow Trigger\nfrom WF1 completion"])
-
-    N1[" Input Node\nReceive Document Info\n{doc_id, topic, level, course_id, tags}"]
-
-    N2[" MongoDB Node\nQuery Matching Users\ndb.users.find({...filters})"]
-
-    N3[" IF Node\nUsers Found?\ncount > 0"]
-
-    N4[" Split In Batches\nProcess 50 users/batch\nAvoid memory overload"]
-
-    N5[" Code Node\nBuild Recommendation\nPersonalize message per user"]
-
-    N6[" Switch Node\nRoute by Channel\ncheck user.notification_preferences"]
-
-    N7A[" SendGrid Node\nSend Email\nHTML Template"]
-    N7B[" HTTP Request\nSend Zalo OA\nPOST zalo-api/message"]
-    N7C[" Slack Node\nSend Slack Message\nFormatted blocks"]
-    N7D[" PostgreSQL Node\nSave In-App Notification\nINSERT notifications"]
-
-    N8[" PostgreSQL Node\nLog Delivery Status\nINSERT user_recommendations"]
-
-    N9[" Code Node\nAggregate Results\ncount sent/failed per channel"]
-
-    N10[" Slack Node\nSend Summary Report\n#ops-notifications channel"]
-
-    SKIP[" No Action\nNo matching users\nLog to POSTGRES"]
-
-    T3 --> N1 --> N2 --> N3
-
-    N3 -->|" Found"| N4
-    N3 -->|" None"| SKIP
-
-    N4 --> N5 --> N6
-
-    N6 -->|email| N7A
-    N6 -->|zalo| N7B
-    N6 -->|slack| N7C
-    N6 -->|always| N7D
-
-    N7A & N7B & N7C & N7D --> N8 --> N9 --> N10
-
-    style T3 fill:#00C853,color:#fff
-    style N7A fill:#E8F5E9
-    style N7B fill:#E3F2FD
-    style N7C fill:#F3E5F5
-    style N7D fill:#FFF8E1
-```
-
-### MongoDB Query Node  Tìm Matching Users
-
-```mermaid
-graph LR
-    subgraph "MongoDB Query Logic"
-        Q["Filter Conditions:\n\n1. level >= doc.level\n   (user đủ trình độ)\n\n2. doc.topic IN user.interests\n   (đúng sở thích)\n\n3. doc.course_id IN user.enrolled_courses\n   (đang học khóa này)\n\n4. notifications_enabled = true\n   (cho phép nhận thông báo)\n\n5. NOT recently recommended\n   (chưa gợi ý trong 7 ngày)\n\nLimit: 1000 users/batch"]
-    end
-```
-
-### Email Template Node (SendGrid)
-
-```mermaid
-graph TD
-    A["SendGrid Node Config"]
-    B["To: {{ $json.user.email }}"]
-    C["Subject:  Tài liệu mới phù hợp với bạn!"]
-    D["Template ID: d-xxxxx (HTML template)"]
-    E["Dynamic Data:\n- user_name: {{ $json.user.name }}\n- doc_title: {{ $json.doc.title }}\n- doc_level: {{ $json.doc.level }}\n- reading_time: {{ $json.doc.estimated_reading_time }}\n- doc_url: {{ $json.doc.url }}\n- topic_tag: {{ $json.doc.topic }}"]
-
-    A --> B & C & D & E
-```
-
----
-
-## 5. Workflow 4  Scheduled Re-indexing
-
-> **Trigger**: Cron job hàng đêm  Kiểm tra & re-index tài liệu lỗi/cũ
-
-```mermaid
-flowchart TD
-    T4([" START\n Cron Trigger\nEvery day at 2:00 AM"])
-
-    N1[" PostgreSQL Node\nQuery Failed Documents\nSELECT * FROM documents\nWHERE status IN ('failed', 'pending')\nAND created_at < NOW() - INTERVAL '1 hour'"]
-
-    N2[" IF Node\nFailed docs found?\ncount > 0"]
-
-    N3[" PostgreSQL Node\nQuery Outdated Documents\nSELECT * FROM documents\nWHERE version < current_model_version\nAND indexed_at < NOW() - 30 days"]
-
-    N4[" Merge Node\nCombine failed + outdated\nDeduplicate by doc_id"]
-
-    N5[" Split In Batches\n10 docs per batch"]
-
-    N6[" AWS S3 Node\nFetch Original File\nfrom s3://bucket/key"]
-
-    N7[" Execute Workflow\nCall WF1\nDocument Indexing Pipeline"]
-
-    N8[" PostgreSQL Node\nUpdate re-index log\nINSERT reindex_history"]
-
-    N9[" Code Node\nBuild Summary Report\n{total, success, failed}"]
-
-    N10[" SendGrid Node\nSend Daily Report Email\nTo: ops-team@weupbook.com"]
-
-    N11[" Slack Node\nPost to #ops-daily\nMarkdown summary"]
-
-    SKIP2[" Skip\nAll documents healthy\nLog: no action needed"]
-
-    T4 --> N1 --> N2
-
-    N2 -->|" Found failures"| N3
-    N2 -->|" All ok"| SKIP2
-
-    N3 --> N4 --> N5 --> N6 --> N7 --> N8 --> N9 --> N10 & N11
-
-    style T4 fill:#FF6F00,color:#fff
-    style SKIP2 fill:#E8F5E9
-```
-
----
-
-## 6. Workflow 5  Error Handling & Alerting
-
-> **Trigger**: Bất kỳ workflow nào thất bại  Alert team + Auto retry
-
-```mermaid
-flowchart TD
-    T5([" ERROR TRIGGER\nN8N Error Workflow\nAny workflow failure"])
-
-    N1[" Input Node\nCapture Error Details\n{workflow_id, node_name,\nerror_message, timestamp,\nretry_count, input_data}"]
-
-    N2[" Code Node\nClassify Error Type\nTimeout / Network / Parse\n/ Auth / Rate Limit / Unknown"]
-
-    N3{"Error Type?"}
-
-    N4A[" Wait Node\nTimeout Error\nWait 30 seconds\nthen retry"]
-
-    N4B[" HTTP Request\nNetwork Error\nRetry with backoff\n1s  2s  4s  8s"]
-
-    N4C[" Code Node\nParse Error\nLog raw data\nSkip + continue"]
-
-    N4D[" Code Node\nAuth Error\nRefresh token\nor alert immediately"]
-
-    N4E[" Wait Node\nRate Limit\nWait until\nreset window"]
-
-    N5[" IF Node\nRetry Attempts < 3?"]
-
-    N6A[" Execute Workflow\nRetry Original Workflow\nwith same input data"]
-
-    N6B[" Critical Alert\nMax retries exceeded\nEscalate to human"]
-
-    N7[" Slack Node\n#ops-alerts channel\nFormatted error message\nwith severity level"]
-
-    N8[" SendGrid Node\nEmail Alert\nops-team@weupbook.com\nOnly for CRITICAL errors"]
-
-    N9[" PostgreSQL Node\nLog Error to DB\nINSERT error_logs\n{workflow, error, status}"]
-
-    T5 --> N1 --> N2 --> N3
-
-    N3 -->|Timeout| N4A
-    N3 -->|Network| N4B
-    N3 -->|Parse| N4C
-    N3 -->|Auth| N4D
-    N3 -->|Rate Limit| N4E
-
-    N4A & N4B & N4C & N4D & N4E --> N5
-
-    N5 -->|"< 3"| N6A
-    N5 -->|">= 3"| N6B
-
-    N6B --> N7 --> N8 --> N9
-
-    style T5 fill:#FF5252,color:#fff
-    style N6B fill:#FF5252,color:#fff
-    style N7 fill:#FFE0B2
-```
-
-### Error Classification Matrix
-
-```mermaid
-graph TD
-    subgraph "Error Severity Levels"
-        P1[" CRITICAL\n- Qdrant down\n- PostgreSQL down\n- Claude API down\nAction: Immediate Slack + Email\nRetry: 3x then escalate"]
-
-        P2[" HIGH\n- Embedding timeout\n- S3 access denied\n- MongoDB slow\nAction: Slack alert\nRetry: 3x exponential backoff"]
-
-        P3[" MEDIUM\n- Single notification fail\n- Parse error 1 doc\n- Cache miss anomaly\nAction: Log only\nRetry: 2x then skip"]
-
-        P4[" LOW\n- Scheduled task delay\n- Minor formatting issue\nAction: Log to DB\nRetry: None"]
-    end
-```
-
----
-
-## 7. N8N Node Configuration Chi tiết
-
-### Credential Setup trong N8N
-
-```mermaid
-graph LR
-    subgraph "N8N Credentials Store"
-        C1["AWS S3\n- Access Key ID\n- Secret Access Key\n- Region: ap-southeast-1"]
-
-        C2["PostgreSQL\n- Host: postgres:5432\n- DB: weupbook\n- User/Pass: ***"]
-
-        C3["MongoDB\n- Connection String\n- mongodb://mongo:27017\n- Database: weupbook"]
-
-        C4["Anthropic Claude\n- API Key: sk-ant-***\n- Model: claude-sonnet-4"]
-
-        C5["SendGrid\n- API Key: SG.***\n- From: noreply@weupbook.com"]
-
-        C6["Slack\n- Bot Token: xoxb-***\n- Signing Secret: ***"]
-
-        C7["Redis\n- Host: redis:6379\n- Password: ***"]
-
-        C8["Qdrant\n- Host: http://qdrant:6333\n- API Key: ***"]
-    end
-```
-
-### Environment Variables cho N8N
-
-```bash
-# .env file cho N8N deployment
-
-# N8N Core
-N8N_HOST=0.0.0.0
-N8N_PORT=5678
-N8N_PROTOCOL=https
-N8N_ENCRYPTION_KEY=your-32-char-secret-key
-
-# Database (N8N internal)
-DB_TYPE=postgresdb
-DB_POSTGRESDB_HOST=postgres
-DB_POSTGRESDB_PORT=5432
-DB_POSTGRESDB_DATABASE=n8n
-DB_POSTGRESDB_USER=n8n_user
-DB_POSTGRESDB_PASSWORD=n8n_password
-
-# Webhook
-WEBHOOK_URL=https://n8n.weupbook.com
-N8N_WEBHOOK_BASE_URL=https://n8n.weupbook.com/webhook
-
-# Queue Mode (for scaling)
-EXECUTIONS_MODE=queue
-QUEUE_BULL_REDIS_HOST=redis
-QUEUE_BULL_REDIS_PORT=6379
-```
-
----
-
-## 8. Deployment N8N
-
-### Docker Compose  N8N Service
-
-```yaml
-version: "3.8"
-
-services:
-  #  N8N Automation Engine 
-  n8n:
-    image: n8nio/n8n:latest
-    container_name: weupbook-n8n
-    restart: always
-    ports:
-      - "5678:5678"
-    environment:
-      - N8N_HOST=0.0.0.0
-      - N8N_PORT=5678
-      - N8N_PROTOCOL=https
-      - WEBHOOK_URL=https://n8n.weupbook.com
-      - DB_TYPE=postgresdb
-      - DB_POSTGRESDB_HOST=postgres
-      - DB_POSTGRESDB_DATABASE=n8n_db
-      - DB_POSTGRESDB_USER=${POSTGRES_USER}
-      - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASS}
-      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
-      - EXECUTIONS_MODE=queue
-      - QUEUE_BULL_REDIS_HOST=redis
-    volumes:
-      - n8n_data:/home/node/.n8n
-      - ./n8n-workflows:/home/node/.n8n/workflows
-    networks:
-      - weupbook-network
-    depends_on:
-      - postgres
-      - redis
-
-  #  N8N Worker (for queue mode) 
-  n8n-worker:
-    image: n8nio/n8n:latest
-    container_name: weupbook-n8n-worker
-    restart: always
-    command: worker
-    environment:
-      - EXECUTIONS_MODE=queue
-      - QUEUE_BULL_REDIS_HOST=redis
-      - DB_TYPE=postgresdb
-      - DB_POSTGRESDB_HOST=postgres
-      - DB_POSTGRESDB_DATABASE=n8n_db
-      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
-    networks:
-      - weupbook-network
-    depends_on:
-      - n8n
-      - redis
-
-volumes:
-  n8n_data:
-
-networks:
-  weupbook-network:
-    driver: bridge
-```
-
-### Kiến trúc Scaling N8N
-
-```mermaid
-graph TB
-    subgraph "Production N8N Setup"
-        LB[" Load Balancer\nnginx / AWS ALB"]
-
-        subgraph "N8N Main (UI + Trigger)"
-            N8N1["N8N Instance 1\n:5678\nWebhook handler\nWorkflow editor"]
-        end
-
-        subgraph "N8N Workers (Execution)"
-            W1["Worker 1\nDocument workflows"]
-            W2["Worker 2\nNotification workflows"]
-            W3["Worker 3\nScheduled workflows"]
-        end
-
-        subgraph "Queue"
-            BULL["Bull Queue\nRedis :6379\nJob management"]
-        end
-    end
-
-    subgraph "Monitoring"
-        PROM["Prometheus\nMetrics"]
-        GRAF["Grafana\nDashboard"]
-    end
-
-    LB --> N8N1
-    N8N1 --> BULL
-    BULL --> W1 & W2 & W3
-
-    W1 & W2 & W3 --> PROM --> GRAF
-
-    style N8N1 fill:#FF6D00,color:#fff
-    style W1 fill:#FFA040
-    style W2 fill:#FFA040
-    style W3 fill:#FFA040
-```
-
----
-
-## Tổng kết: Workflow Integration Map
+### 2. Giải thích chiến lược xử lý dữ liệu và Prompt
+
+#### a) Chiến lược Chunk Size và Metadata
+
+| Thành phần | Chiến lược | Lý do |
+| :--- | :--- | :--- |
+| **Chunk Size** | **512 - 1024 tokens** (có overlap ~10-15%) | - Đủ lớn để chứa một ý hoàn chỉnh trong tài liệu học.<br>- Đủ nhỏ để tập trung vào một chủ đề, tăng độ chính xác khi truy vấn và phù hợp với context window của LLM.<br>- Overlap giúp không bị mất ngữ cảnh ở biên giữa các chunk. |
+| **Metadata (Document Level)** | `doc_id`, `source` (S3 URI), `title`, `upload_date`, `course_id` | Dùng để truy xuất nguồn, tạo link, hiển thị thông tin tài liệu gốc cho user. |
+| **Metadata (Chunk Level)** | `topic` (chủ đề con), `level` (beginner/intermediate), `page_number` (nếu là PDF) | - **`level`**: Lọc vector search ngay từ đầu, chỉ lấy các chunk phù hợp với trình độ user, tránh gợi ý sai level.<br>- **`topic`**: Giúp gom nhóm các chunk liên quan và cá nhân hóa theo sở thích. |
+
+#### b) Thiết kế Prompt (Cá nhân hóa và Tránh chung chung)
+
+Prompt được thiết kế động, bao gồm 3 phần chính:
+
+1.  **System Prompt (Vai trò và Quy tắc):**
+    ```text
+    Bạn là một trợ lý học tập thông minh cho nền tảng WeupBook. Nhiệm vụ của bạn là trả lời câu hỏi của người dùng DỰA TRÊN các đoạn tài liệu được cung cấp (ngữ cảnh) và ĐƯA RA gợi ý tài liệu cụ thể.
+
+    QUY TẮC QUAN TRỌNG:
+    1.  TRẢ LỜI DỰA TRÊN NGỮ CẢNH: Chỉ sử dụng thông tin trong phần <context> để trả lời. Nếu câu trả lời không có trong ngữ cảnh, hãy nói "Tôi không tìm thấy thông tin này trong tài liệu hiện có."
+    2.  PHÂN BIỆT TRÌNH ĐỘ: Người dùng hiện tại có trình độ {{user_level}}. Hãy điều chỉnh cách giải thích cho phù hợp (ví dụ: dùng ví dụ đơn giản cho Beginner, đi sâu vào thuật ngữ chuyên ngành cho Intermediate).
+    3.  GỢI Ý CỤ THỂ: Ở cuối câu trả lời, luôn liệt kê các tài liệu nguồn bạn đã dùng (kèm tên, chủ đề, link) và gợi ý 1-2 tài liệu liên quan khác từ ngữ cảnh.
+    4.  TRÁNH CHUNG CHUNG: Không đưa ra kiến thức nền tảng không có trong tài liệu. Câu trả lời phải bám sát nội dung học.
+    ```
+
+2.  **Context (Kết quả từ Vector DB):**
+    ```text
+    <context>
+    [1] [Tài liệu: Nhập môn Python, Level: Beginner, Chủ đề: Biến]
+    Nội dung: Biến trong Python giống như một cái hộp để lưu trữ giá trị. Bạn có thể đặt tên cho nó và gán dữ liệu bằng dấu '='. Ví dụ: ten_sinh_vien = "An" sẽ lưu chữ "An" vào biến ten_sinh_vien.
+    
+    [2] [Tài liệu: Lập trình hướng đối tượng, Level: Intermediate, Chủ đề: Class]
+    Nội dung: Class là một bản thiết kế (blueprint) để tạo ra các đối tượng (object). Nó định nghĩa các thuộc tính (attribute) và phương thức (method) mà đối tượng sẽ có. Ví dụ: class SinhVien: def __init__(self, ten): self.ten = ten
+    ...
+    </context>
+    ```
+
+3.  **User Query:**
+    ```text
+    Câu hỏi của người dùng (trình độ {{user_level}}, sở thích {{user_interests}}): {{user_question}}
+    ```
+
+## B. Workflow Tự động hóa với n8n
+
+### 1. Sơ đồ Workflow chi tiết (n8n)
+
+Hệ thống sử dụng **n8n** để tự động hóa toàn bộ quy trình từ khi có tài liệu mới đến khi gửi thông báo cho người dùng.
 
 ```mermaid
 flowchart LR
-    subgraph "TRIGGERS"
-        T1[" S3 Upload"]
-        T2[" User Query"]
-        T3[" Cron 2AM"]
-        T4[" WF1 Completion"]
-        T5[" Any Error"]
+    subgraph Trigger [Trigger & Input]
+        A[("S3 Bucket<br/>New File Upload")] --> B["n8n Trigger:<br/>S3 'New File' Event"]
+        B --> C["Get File Metadata<br/>(Bucket, Key, Size)"]
     end
 
-    subgraph "N8N WORKFLOWS"
-        WF1["WF1\nDocument Indexing\n~3-5 min/doc"]
-        WF2["WF2\nRAG Query\n< 2 sec"]
-        WF3["WF3\nNotification\n< 1 min"]
-        WF4["WF4\nRe-indexing\nNightly batch"]
-        WF5["WF5\nError Handler\nReal-time"]
+    subgraph Process [Xử lý & Index]
+        D["Download File from S3"]
+        E{"File Type?"}
+        F["Parse PDF"]
+        G["Transcribe Audio/Video<br/>(if needed, or get transcript)"]
+        H["Extract & Clean Text"]
+        I["Chunking & Add Metadata<br/>(level, topic, doc_id)"]
+        J["Generate Embeddings<br/>(via HTTP Request node)"]
+        K["Upsert to Vector DB<br/>(via HTTP Request node)"]
     end
 
-    subgraph "OUTCOMES"
-        O1[" Document Indexed\nin Qdrant"]
-        O2[" Answer + Docs\nto User"]
-        O3[" Notifications\nSent to Users"]
-        O4[" Failed Docs\nRecovered"]
-        O5[" Team Alerted\nIssues Resolved"]
+    subgraph Notification [Cá nhân hóa & Gửi thông báo]
+        L["Fetch Active Users<br/>from DB (PostgreSQL node)"]
+        M["For each user:<br/>Call Matching Logic"]
+        N["Get User Profile<br/>(level, interests, history)"]
+        O["Query Vector DB<br/>for relevant new doc chunks<br/>(filter by user level & topic)"]
+        P{"Has new relevant<br/>content?"}
+        Q["Generate Notification Content<br/>via LLM (optional)"]
+        R["Send Notification<br/>(Email/Slack node)"]
     end
 
-    T1 --> WF1 --> O1
-    WF1 --> WF3
+    %% Connections for Process
+    C --> D
+    D --> E
+    E -- "PDF" --> F --> H
+    E -- "Video/Audio" --> G --> H
+    E -- "Text" --> H
+    H --> I --> J --> K
 
-    T2 --> WF2 --> O2
-
-    T4 --> WF3 --> O3
-
-    T3 --> WF4 --> O4
-
-    T5 --> WF5 --> O5
-
-    style WF1 fill:#FFC6C6
-    style WF2 fill:#E6F3FF
-    style WF3 fill:#E6FFE6
-    style WF4 fill:#FFF3E6
-    style WF5 fill:#FFE6F3
+    %% Connections for Notification
+    K --> L
+    L --> M
+    M --> N
+    N --> O
+    O --> P
+    P -- "Yes" --> Q --> R
+    P -- "No" --> End[("End<br/>(No notification)")]
+    
+    classDef storage fill:#F9E79F,stroke:#B7950B;
+    classDef n8n fill:#A9DFBF,stroke:#196F3D;
+    classDef db fill:#AED6F1,stroke:#1F618D;
+    classDef decision fill:#F5B7B1,stroke:#C0392B;
+    
+    class A,K storage;
+    class B,C,D,F,G,H,I,J,M,O,P,R n8n;
+    class L,N db;
+    class E,P decision;
 ```
 
----
+### 2. Xử lý lỗi (Error Handling)
 
->  **Ghi chú**: Toàn bộ workflow N8N có thể export/import dưới dạng JSON và version-control trên Git. Mỗi workflow nên có documentation đi kèm và unit test với N8N's built-in execution history.
+1.  **Lỗi File hỏng / Không parse được:**
+    - **Bước phát hiện:** Trong node "Parse PDF" hoặc "Extract Text", nếu có exception hoặc output rỗng.
+    - **Xử lý:**
+        - Ghi log lỗi chi tiết (file name, bucket, lỗi) vào một bảng `error_logs` trong DB hoặc file log riêng.
+        - Gửi thông báo (Slack/Email) đến admin hệ thống với nội dung: `[ERROR] Không thể xử lý file: {file_name}. Lỗi: {error_message}. Cần kiểm tra thủ công.`
+        - **Dừng workflow cho file này** (không index và không gửi thông báo).
+
+2.  **Lỗi Timeout / Rate Limit từ API bên ngoài (Embedding, LLM):**
+    - **Bước phát hiện:** HTTP Request node trả về mã lỗi 429 (Rate Limit) hoặc timeout.
+    - **Xử lý:**
+        - Sử dụng tính năng **Retry** của n8n (ví dụ: thử lại tối đa 3 lần, với thời gian chờ tăng dần: 1s, 5s, 15s).
+        - Nếu vẫn thất bại sau 3 lần, ghi log và đánh dấu tài liệu đó có trạng thái "indexing_failed".
+        - Đối với rate limit, có thể thêm một node `Wait` phía trước để làm chậm tốc độ gửi request.
+
+3.  **Lỗi S3 không trả kết quả / Mạng:**
+    - **Bước phát hiện:** Node trigger S3 không nhận được event hoặc node download file bị lỗi kết nối.
+    - **Xử lý:**
+        - Cấu hình S3 event gửi vào một **Dead Letter Queue (DLQ)** của SQS. Nếu sau nhiều lần thử xử lý event không thành công, nó sẽ được chuyển vào DLQ để admin có thể xem xét và xử lý lại sau.
+        - Workflow n8n nên được thiết kế để bắt lỗi kết nối và gửi cảnh báo tới team kỹ thuật.
+
+## C. Đề xuất Tối ưu (Không bắt buộc)
+
+1.  **Tối ưu chi phí Token và Tốc độ:**
+    - **Hybrid Search:** Kết hợp Vector Search (tìm theo ngữ nghĩa) với Keyword Search (tìm theo từ khóa, dùng BM25). Điều này giúp giảm số lượng chunk cần lấy từ vector DB (top-K nhỏ hơn) mà vẫn đảm bảo độ chính xác, từ đó giảm số token đưa vào LLM.
+    - **Caching:** Sử dụng Redis để cache kết quả cho các câu hỏi giống nhau hoặc tương tự từ nhiều user. Đặc biệt hiệu quả với các tài liệu phổ biến.
+    - **Reranking:** Thay vì lấy 10 chunk và cho tất cả vào prompt, hãy lấy 20-30 chunk, sau đó dùng một mô hình Reranker nhỏ để chọn ra 5-7 chunk chất lượng nhất. Giảm nhiễu và tiết kiệm token.
+    - **Prompt Cache:** Một số nhà cung cấp LLM (ví dụ: Gemini) hỗ trợ prompt caching. Nếu phần system prompt và context dài, việc cache sẽ giảm đáng kể chi phí và thời gian xử lý.
+
+2.  **Tránh gợi ý trùng lặp và cá nhân hóa:**
+    - **Đa dạng hóa (MMR):** Khi query vector DB, sử dụng thuật toán **Maximum Marginal Relevance (MMR)**. Thuật toán này vừa tìm các chunk *liên quan* nhất, vừa đảm bảo chúng *khác nhau* về nội dung, tránh việc lấy toàn bộ các chunk giống nhau từ một đoạn tài liệu.
+    - **Lọc theo lịch sử:** Khi query vector DB để tìm tài liệu gợi ý, thêm filter loại trừ các `doc_id` mà user đã học hoặc đã được gợi ý trong 7 ngày gần nhất (lấy từ DB).
+    - **Phân tích sở thích động:** Không chỉ dùng level và sở thích tĩnh từ profile, mà còn có thể phân tích lịch sử tương tác gần nhất của user (các câu hỏi gần đây, tài liệu họ xem nhiều) để tạo ra một "user embedding" tạm thời. Sau đó, dùng embedding này để tìm các tài liệu có nội dung tương tự.
